@@ -24,8 +24,11 @@ import {
   FACE_SHORT,
   SEGMENT_FACES,
   formatRange,
+  isValidSplitPoint,
+  planSegmentSplit,
   type Segment,
-  type SegmentFace
+  type SegmentFace,
+  type SegmentSplitPlan
 } from '@/types/segment'
 import {
   DEFECT_STATES,
@@ -334,6 +337,65 @@ async function removeSegment(segment: Segment): Promise<void> {
   }
   await bladeStore.removeSegment(segment.id)
   ElMessage.success(`已删除第 ${segment.index} 段`)
+}
+
+/* ---------------- 单段拆分 ---------------- */
+const splitVisible = ref(false)
+const splitTarget = ref<Segment | null>(null)
+const splitMeter = ref(0)
+const splitSubmitting = ref(false)
+
+/** 打开拆分对话框：分界米数默认取段中点（保留一位小数，避免落在边界上） */
+function openSplit(segment: Segment): void {
+  splitTarget.value = segment
+  const midpoint = Math.round(((segment.startM + segment.endM) / 2) * 10) / 10
+  splitMeter.value = Math.min(Math.max(midpoint, segment.startM + 0.1), segment.endM - 0.1)
+  splitVisible.value = true
+}
+
+/** 拆分目标段当前的全部缺陷（不套用筛选，保证归段不丢缺陷） */
+const splitDefects = computed(() =>
+  splitTarget.value ? bladeStore.defectsOfSegment(splitTarget.value.id) : []
+)
+
+const splitPlan = computed<SegmentSplitPlan | null>(() =>
+  splitTarget.value
+    ? planSegmentSplit(splitTarget.value, splitDefects.value, splitMeter.value)
+    : null
+)
+
+/** 序号会顺延的后续段提示文案 */
+const shiftedSegmentHint = computed(() => {
+  const target = splitTarget.value
+  if (!target) return ''
+  const shifted = segments.value
+    .filter((segment) => segment.index > target.index)
+    .map((segment) => segment.index)
+  if (shifted.length === 0) return '本段之后没有其他分段，无需顺延。'
+  return `第 ${shifted.join('、')} 段序号顺延为 ${shifted.map((index) => index + 1).join('、')}。`
+})
+
+async function submitSplit(): Promise<void> {
+  const target = splitTarget.value
+  if (!target) return
+  if (!isValidSplitPoint(target.startM, target.endM, splitMeter.value)) {
+    ElMessage.warning(
+      `分界米数必须严格落在第 ${target.index} 段区间 ${formatRange(target.startM, target.endM)} 内`
+    )
+    return
+  }
+  splitSubmitting.value = true
+  try {
+    const result = await bladeStore.splitSegment(target.id, splitMeter.value)
+    splitVisible.value = false
+    ElMessage.success(
+      `第 ${result.frontSegment.index} 段已拆分：前段保留 ${result.frontDefects} 条缺陷，新段第 ${result.rearSegment.index} 段接走 ${result.rearDefects} 条，工单保持不变`
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '拆分失败，请重试')
+  } finally {
+    splitSubmitting.value = false
+  }
 }
 
 /* ---------------- 剖面图上传 ---------------- */
@@ -761,9 +823,10 @@ const faceSummary = computed(() =>
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="200" fixed="right">
+          <el-table-column label="操作" width="250" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" @click="openDefectCreate(row)">标注缺陷</el-button>
+              <el-button link type="primary" @click="openSplit(row)">拆分</el-button>
               <el-button link type="primary" @click="openSegmentEdit(row)">编辑</el-button>
               <el-button link type="danger" @click="removeSegment(row)">删除</el-button>
             </template>
@@ -841,6 +904,74 @@ const faceSummary = computed(() =>
       <template #footer>
         <el-button @click="segmentVisible = false">取消</el-button>
         <el-button type="primary" :loading="segmentSubmitting" @click="submitSegment">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="splitVisible"
+      :title="splitTarget ? `拆分第 ${splitTarget.index} 段` : '单段拆分'"
+      width="560px"
+      destroy-on-close
+    >
+      <template v-if="splitTarget">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          :title="`第 ${splitTarget.index} 段当前区间 ${formatRange(splitTarget.startM, splitTarget.endM)}（${faceText(splitTarget.face)} · ${splitTarget.airfoil}），共 ${splitDefects.length} 条缺陷`"
+          class="split-alert"
+        />
+        <el-form label-width="120px" class="split-form">
+          <el-form-item label="分界米数">
+            <el-input-number
+              v-model="splitMeter"
+              :min="0"
+              :max="130"
+              :step="0.1"
+              :precision="2"
+              :controls="false"
+            />
+            <span class="muted unit">米</span>
+            <span v-if="!splitPlan" class="split-warn">
+              需严格落在 {{ formatRange(splitTarget.startM, splitTarget.endM) }} 之间（不含端点）
+            </span>
+          </el-form-item>
+        </el-form>
+
+        <template v-if="splitPlan">
+          <div class="split-grid">
+            <div class="split-cell">
+              <strong>前段 · 第 {{ splitTarget.index }} 段</strong>
+              <span class="mono">
+                {{ formatRange(splitTarget.startM, splitPlan.boundaryM) }}
+              </span>
+              <span class="muted">保留原起点；剖面图移至新段，需重新挂接</span>
+              <el-tag size="small" type="warning">{{ splitPlan.frontDefects }} 条缺陷</el-tag>
+            </div>
+            <div class="split-cell split-cell--rear">
+              <strong>新段 · 第 {{ splitTarget.index + 1 }} 段</strong>
+              <span class="mono">
+                {{ formatRange(splitPlan.boundaryM, splitTarget.endM) }}
+              </span>
+              <span class="muted">接住后半段与原剖面图（{{ splitTarget.sectionImage || '未上传' }}）</span>
+              <el-tag size="small" type="success">{{ splitPlan.rearDefects }} 条缺陷</el-tag>
+            </div>
+          </div>
+          <ul class="split-notes">
+            <li>
+              缺陷按展向位置归段；长度跨过分界点的 {{ splitPlan.crossBoundaryDefects }} 条缺陷，
+              按两侧覆盖长度多的一侧归段，覆盖同样多时归根部侧（前段）。
+            </li>
+            <li>{{ shiftedSegmentHint }}</li>
+            <li>缺陷属性与维修工单原样保留，叶片段数、段内缺陷汇总与巡检报告明细同步更新。</li>
+          </ul>
+        </template>
+      </template>
+      <template #footer>
+        <el-button @click="splitVisible = false">取消</el-button>
+        <el-button type="primary" :loading="splitSubmitting" :disabled="!splitPlan" @click="submitSplit">
+          确认拆分
+        </el-button>
       </template>
     </el-dialog>
 
@@ -1001,5 +1132,49 @@ const faceSummary = computed(() =>
 .unit {
   margin: 0 8px;
   font-size: 12px;
+}
+
+.split-alert {
+  margin-bottom: 16px;
+}
+
+.split-form :deep(.el-input-number) {
+  width: 160px;
+}
+
+.split-warn {
+  margin-left: 8px;
+  color: var(--el-color-danger);
+  font-size: 12px;
+}
+
+.split-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  width: 100%;
+}
+
+.split-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #f7fbfd;
+  font-size: 13px;
+}
+
+.split-cell--rear {
+  background: #f3f9f5;
+}
+
+.split-notes {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  color: #4a5b63;
+  font-size: 12px;
+  line-height: 1.7;
 }
 </style>

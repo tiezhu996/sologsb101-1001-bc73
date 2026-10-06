@@ -78,3 +78,82 @@ export interface SegmentGenerateOptions {
 export function formatRange(startM: number, endM: number): string {
   return `${startM.toFixed(1)}-${endM.toFixed(1)} m`
 }
+
+/* ---------------- 单段拆分 ---------------- */
+
+/** 参与拆分归段计算的最小缺陷结构（types 层不反向依赖 defect.ts） */
+export interface SplitDefectLike {
+  /** 展向位置（米，缺陷中点） */
+  positionM: number
+  /** 缺陷长度（毫米），换算成展向跨度判断是否跨过分界点 */
+  lengthMm: number
+}
+
+/** 拆分归段结果：front 前段（根部侧）/ rear 新段（叶尖侧） */
+export type SplitPlacement = 'front' | 'rear'
+
+/** 分界点是否严格落在段内（不含两个端点） */
+export function isValidSplitPoint(startM: number, endM: number, splitM: number): boolean {
+  return Number.isFinite(splitM) && splitM > startM && splitM < endM
+}
+
+/**
+ * 单段拆分时确定一条缺陷归入前段还是新段：
+ * 以 positionM 为中点、lengthMm 换算展向跨度（超出本段的部分裁掉），
+ * 比较缺陷在分界点两侧的覆盖长度，覆盖更多的一侧接走；同样多时以根部侧（前段）为准。
+ */
+export function splitPlacementForDefect(
+  startM: number,
+  endM: number,
+  splitM: number,
+  defect: SplitDefectLike
+): SplitPlacement {
+  const halfSpanM = defect.lengthMm / 2000 // 毫米 → 米后取半
+  const defectStart = Math.max(startM, defect.positionM - halfSpanM)
+  const defectEnd = Math.min(endM, defect.positionM + halfSpanM)
+  const frontCover = Math.max(0, Math.min(defectEnd, splitM) - defectStart)
+  const rearCover = Math.max(0, defectEnd - Math.max(defectStart, splitM))
+  return rearCover > frontCover ? 'rear' : 'front'
+}
+
+/** 拆分对话框预览的归段预案 */
+export interface SegmentSplitPlan {
+  /** 归一化（保留两位小数）后的分界米数 */
+  boundaryM: number
+  /** 归入前段（根部侧）的缺陷数 */
+  frontDefects: number
+  /** 归入新段（叶尖侧）的缺陷数 */
+  rearDefects: number
+  /** 长度跨过分界点的缺陷数 */
+  crossBoundaryDefects: number
+}
+
+/**
+ * 计算单段拆分预案；分界点不合法时返回 null。
+ * 页面预览与 store 写库共用同一套归段口径。
+ */
+export function planSegmentSplit(
+  segment: Pick<Segment, 'startM' | 'endM'>,
+  defects: readonly SplitDefectLike[],
+  splitM: number
+): SegmentSplitPlan | null {
+  const boundaryM = Math.round(splitM * 100) / 100
+  if (!isValidSplitPoint(segment.startM, segment.endM, boundaryM)) return null
+  let front = 0
+  let rear = 0
+  let cross = 0
+  defects.forEach((defect) => {
+    const halfSpanM = defect.lengthMm / 2000
+    if (defect.positionM - halfSpanM < boundaryM && defect.positionM + halfSpanM > boundaryM) {
+      cross += 1
+    }
+    if (
+      splitPlacementForDefect(segment.startM, segment.endM, boundaryM, defect) === 'rear'
+    ) {
+      rear += 1
+    } else {
+      front += 1
+    }
+  })
+  return { boundaryM, frontDefects: front, rearDefects: rear, crossBoundaryDefects: cross }
+}

@@ -1,15 +1,32 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { db, readUiPrefs, round2, writeUiPrefs } from '@/utils/db'
+import { createId, db, readUiPrefs, round2, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import type { Blade, BladeStat } from '@/types/blade'
-import type { Segment, SegmentGenerateOptions, SegmentStat } from '@/types/segment'
+import {
+  isValidSplitPoint,
+  splitPlacementForDefect,
+  type Segment,
+  type SegmentGenerateOptions,
+  type SegmentStat
+} from '@/types/segment'
 import type { Defect } from '@/types/defect'
 import type { WorkOrder } from '@/types/workOrder'
 
 export interface GenerateSegmentsResult {
   created: number
   removed: number
+}
+
+export interface SplitSegmentResult {
+  /** 前段（保留原 id 与原起点） */
+  frontSegment: Segment
+  /** 新段（接住后半段与原剖面图） */
+  rearSegment: Segment
+  /** 归入前段的缺陷数 */
+  frontDefects: number
+  /** 归入新段的缺陷数 */
+  rearDefects: number
 }
 
 /**
@@ -213,6 +230,89 @@ export const useBladeStore = defineStore('blade', () => {
     if (segment) await syncSegmentCount(segment.bladeId)
   }
 
+  /**
+   * 单段拆分：在分界米数处把指定段切成两段。
+   * - 前段保留原 id / 原起点，区间改为 startM-splitM；
+   * - 新段（原段 index + 1）接住 splitM-endM 与原剖面图；
+   * - 后续段序号顺延；原段缺陷按位置归段（跨边界覆盖更多者优先，等量归根部侧）；
+   * - 缺陷属性与维修工单原样保留（工单经 defectId 关联，无需改动）。
+   */
+  async function splitSegment(id: string, rawSplitM: number): Promise<SplitSegmentResult> {
+    const original = segments.value.find((item) => item.id === id)
+    if (!original) throw new Error('待拆分的分段不存在')
+    const splitM = round2(rawSplitM)
+    if (!isValidSplitPoint(original.startM, original.endM, splitM)) {
+      throw new Error('分界米数必须严格落在该分段区间内')
+    }
+
+    const bladeId = original.bladeId
+    const list = segmentsOfBlade(bladeId)
+    // 倒序顺延，避免序号临时重叠
+    const following = list.filter((segment) => segment.index > original.index).reverse()
+    const segmentDefects = defectsOfSegment(id)
+    const now = Date.now()
+
+    let frontCount = 0
+    let rearCount = 0
+    const moveToRear: Defect[] = []
+    segmentDefects.forEach((defect) => {
+      const placement = splitPlacementForDefect(original.startM, original.endM, splitM, defect)
+      if (placement === 'rear') {
+        rearCount += 1
+        moveToRear.push(defect)
+      } else {
+        frontCount += 1
+      }
+    })
+
+    const frontSegment: Segment = {
+      ...original,
+      endM: splitM,
+      // 原剖面图随后半段交给新段，前段需重新挂接
+      sectionImage: '',
+      sectionPreview: '',
+      updatedAt: now
+    }
+    const rearSegment: Segment = {
+      id: createId('seg'),
+      bladeId,
+      index: original.index + 1,
+      startM: splitM,
+      endM: original.endM,
+      airfoil: original.airfoil,
+      face: original.face,
+      sectionImage: original.sectionImage,
+      sectionPreview: original.sectionPreview,
+      createdAt: now,
+      updatedAt: now
+    }
+
+    await db.transaction('rw', [db.segments, db.defects, db.blades], async () => {
+      await db.segments.put(frontSegment)
+      await db.segments.put(rearSegment)
+      const shiftNow = Date.now()
+      await db.segments.bulkPut(
+        following.map((segment) => ({ ...segment, index: segment.index + 1, updatedAt: shiftNow }))
+      )
+      if (moveToRear.length > 0) {
+        const rearId = rearSegment.id
+        await db.defects
+          .where('id')
+          .anyOf(moveToRear.map((defect) => defect.id))
+          .modify((defect) => {
+            defect.segmentId = rearId
+          })
+      }
+      // 段数 +1：在事务内按库内实际数量回写，避免 liveQuery 尚未刷新取到旧值
+      const count = await db.segments.where('bladeId').equals(bladeId).count()
+      const bladeRow = await db.blades.get(bladeId)
+      if (bladeRow && bladeRow.segmentCount !== count) {
+        await db.blades.update(bladeId, { segmentCount: count, updatedAt: Date.now() })
+      }
+    })
+    return { frontSegment, rearSegment, frontDefects: frontCount, rearDefects: rearCount }
+  }
+
   /** 分段增删后回写叶片的 segmentCount，保证台账回显一致 */
   async function syncSegmentCount(bladeId: string): Promise<void> {
     const count = segmentsOfBlade(bladeId).length
@@ -248,6 +348,7 @@ export const useBladeStore = defineStore('blade', () => {
     clearSectionImage,
     removeSegment,
     removeSegmentsOfBlade,
+    splitSegment,
     syncSegmentCount
   }
 })
