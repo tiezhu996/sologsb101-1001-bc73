@@ -1,15 +1,36 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { db, readUiPrefs, round2, writeUiPrefs } from '@/utils/db'
+import { createId, db, readUiPrefs, round2, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import type { Blade, BladeStat } from '@/types/blade'
-import type { Segment, SegmentGenerateOptions, SegmentStat } from '@/types/segment'
+import { formatRange, type Segment, type SegmentGenerateOptions, type SegmentStat } from '@/types/segment'
 import type { Defect } from '@/types/defect'
 import type { WorkOrder } from '@/types/workOrder'
 
 export interface GenerateSegmentsResult {
   created: number
   removed: number
+}
+
+export interface SplitSegmentResult {
+  frontSegment: Segment
+  backSegment: Segment
+  movedDefectIds: string[]
+}
+
+/**
+ * 判断缺陷在分界米数两侧的归属。
+ * positionM 作为缺陷展向中点；跨越分界时按两侧覆盖长度归类，等长归根部侧（前段）。
+ */
+function defectBelongsToBack(defect: Defect, splitM: number): boolean {
+  const halfLengthM = defect.lengthMm / 2000
+  const defectStartM = defect.positionM - halfLengthM
+  const defectEndM = defect.positionM + halfLengthM
+
+  if (defectEndM <= splitM) return false
+  if (defectStartM >= splitM) return true
+
+  return defectEndM - splitM > splitM - defectStartM
 }
 
 /**
@@ -186,6 +207,68 @@ export const useBladeStore = defineStore('blade', () => {
     return segment
   }
 
+  /**
+   * 单段拆分：前段保留原起点，新段从分界点接住后半段与原剖面图；
+   * 后续段序号顺延，段内缺陷按展向覆盖长度重新归属，工单按 defectId 自动跟随。
+   */
+  async function splitSegment(id: string, rawSplitM: number): Promise<SplitSegmentResult> {
+    const segment = await db.segments.get(id)
+    if (!segment) throw new Error('未找到要拆分的分段')
+
+    const splitM = round2(rawSplitM)
+    if (!(splitM > segment.startM && splitM < segment.endM)) {
+      throw new Error(`分界米数必须落在 ${formatRange(segment.startM, segment.endM)} 内`)
+    }
+
+    const now = Date.now()
+    const bladeSegments = await db.segments
+      .where('bladeId')
+      .equals(segment.bladeId)
+      .toArray()
+      .then((list) => list.sort((a, b) => a.index - b.index))
+
+    const frontSegment: Segment = {
+      ...segment,
+      endM: splitM,
+      sectionImage: '',
+      sectionPreview: '',
+      updatedAt: now
+    }
+    const backSegment: Segment = {
+      ...segment,
+      id: createId('seg'),
+      index: segment.index + 1,
+      startM: splitM,
+      endM: segment.endM,
+      sectionImage: segment.sectionImage,
+      sectionPreview: segment.sectionPreview,
+      createdAt: now,
+      updatedAt: now
+    }
+    const shiftedSegments = bladeSegments
+      .filter((item) => item.index > segment.index)
+      .map((item) => ({ ...item, index: item.index + 1 }))
+
+    const segmentDefects = await db.defects.where('segmentId').equals(segment.id).toArray()
+    const movedDefects = segmentDefects.filter((defect) => defectBelongsToBack(defect, splitM))
+    const movedDefectIds = movedDefects.map((defect) => defect.id)
+
+    await db.transaction('rw', [db.blades, db.segments, db.defects], async () => {
+      await db.segments.bulkPut([frontSegment, backSegment, ...shiftedSegments])
+      if (movedDefectIds.length > 0) {
+        await db.defects.where('id').anyOf(movedDefectIds).modify((defect) => {
+          defect.segmentId = backSegment.id
+        })
+      }
+      await db.blades.update(segment.bladeId, {
+        segmentCount: bladeSegments.length + 1,
+        updatedAt: now
+      })
+    })
+
+    return { frontSegment, backSegment, movedDefectIds }
+  }
+
   async function updateSegment(id: string, patch: Partial<Segment>): Promise<void> {
     await segmentsTable.update(id, patch)
   }
@@ -243,6 +326,7 @@ export const useBladeStore = defineStore('blade', () => {
     bladeStat,
     generateSegments,
     createSegment,
+    splitSegment,
     updateSegment,
     setSectionImage,
     clearSectionImage,

@@ -8,7 +8,7 @@ import {
   type FormRules,
   type UploadFile
 } from 'element-plus'
-import { MagicStick, Picture, Plus, Upload, WarningFilled } from '@element-plus/icons-vue'
+import { MagicStick, Picture, Plus, Scissor, Upload, WarningFilled } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
@@ -334,6 +334,45 @@ async function removeSegment(segment: Segment): Promise<void> {
   }
   await bladeStore.removeSegment(segment.id)
   ElMessage.success(`已删除第 ${segment.index} 段`)
+}
+
+/* ---------------- 单段拆分 ---------------- */
+const splitVisible = ref(false)
+const splitSubmitting = ref(false)
+const splitSegmentRow = ref<Segment | null>(null)
+const splitForm = reactive({ boundaryM: 0 })
+
+function openSplit(segment: Segment): void {
+  splitSegmentRow.value = segment
+  splitForm.boundaryM = Number(((segment.startM + segment.endM) / 2).toFixed(2))
+  splitVisible.value = true
+}
+
+async function submitSplit(): Promise<void> {
+  const target = splitSegmentRow.value
+  if (!target) return
+  if (typeof splitForm.boundaryM !== 'number' || Number.isNaN(splitForm.boundaryM)) {
+    ElMessage.warning('请填写有效的分界米数')
+    return
+  }
+  if (!(splitForm.boundaryM > target.startM && splitForm.boundaryM < target.endM)) {
+    ElMessage.warning(
+      `分界米数必须严格落在第 ${target.index} 段区间 ${formatRange(target.startM, target.endM)} 内`
+    )
+    return
+  }
+  splitSubmitting.value = true
+  try {
+    const result = await bladeStore.splitSegment(target.id, splitForm.boundaryM)
+    splitVisible.value = false
+    ElMessage.success(
+      `已拆分第 ${target.index} 段，${result.movedDefectIds.length} 条缺陷归入新的第 ${target.index + 1} 段`
+    )
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '分段拆分失败')
+  } finally {
+    splitSubmitting.value = false
+  }
 }
 
 /* ---------------- 剖面图上传 ---------------- */
@@ -761,9 +800,10 @@ const faceSummary = computed(() =>
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="200" fixed="right">
+          <el-table-column label="操作" width="260" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" @click="openDefectCreate(row)">标注缺陷</el-button>
+              <el-button link type="primary" :icon="Scissor" @click="openSplit(row)">拆分</el-button>
               <el-button link type="primary" @click="openSegmentEdit(row)">编辑</el-button>
               <el-button link type="danger" @click="removeSegment(row)">删除</el-button>
             </template>
@@ -841,6 +881,37 @@ const faceSummary = computed(() =>
       <template #footer>
         <el-button @click="segmentVisible = false">取消</el-button>
         <el-button type="primary" :loading="segmentSubmitting" @click="submitSegment">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="splitVisible" title="单段拆分" width="560px" destroy-on-close>
+      <template v-if="splitSegmentRow">
+        <el-form label-width="120px">
+          <el-form-item label="待拆分分段">
+            <span>第 {{ splitSegmentRow.index }} 段 · {{ formatRange(splitSegmentRow.startM, splitSegmentRow.endM) }}</span>
+          </el-form-item>
+          <el-form-item label="分界米数">
+            <el-input-number
+              v-model="splitForm.boundaryM"
+              :min="splitSegmentRow.startM"
+              :max="splitSegmentRow.endM"
+              :step="0.1"
+              :precision="2"
+            />
+            <span class="muted unit">米</span>
+          </el-form-item>
+        </el-form>
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="拆分后前段保留原起点，新段接住后半段、翼型与原剖面图；后续段序号顺延。"
+          description="已有缺陷只调整所属分段：按展向位置归类；缺陷长度跨越分界时，覆盖更多的一侧承接，覆盖等长时归根部侧。缺陷属性与工单原样保留。"
+        />
+      </template>
+      <template #footer>
+        <el-button @click="splitVisible = false">取消</el-button>
+        <el-button type="primary" :loading="splitSubmitting" @click="submitSplit">确认拆分</el-button>
       </template>
     </el-dialog>
 
