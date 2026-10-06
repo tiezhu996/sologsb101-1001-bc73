@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="风电叶片巡检">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0f5c7a" />
+      <stop offset="100%" stop-color="#1f8fa8" />
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#sky)" />
+  <g stroke="#f2f8fa" stroke-width="3" stroke-linecap="round" fill="none">
+    <path d="M32 33 L32 12" />
+    <path d="M32 33 L48 42" />
+    <path d="M32 33 L16 42" />
+  </g>
+  <circle cx="32" cy="33" r="4.5" fill="#f2f8fa" />
+  <path d="M28 49 h8 l3 7 H25 z" fill="#f2f8fa" opacity="0.85" />
+  <circle cx="46" cy="17" r="3" fill="#ffd166" />
+</svg>
